@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import Request
 
 from .agents.registry import AgentRegistry
+from .db.session import Database
 from .gateway.router import ModelRouter
 from .rag.service import KnowledgeService
 from .tools.registry import ToolRegistry
@@ -23,3 +24,7 @@ def get_agent_registry(request: Request) -> AgentRegistry:
 
 def get_knowledge(request: Request) -> KnowledgeService:
     return request.app.state.knowledge
+
+
+def get_database(request: Request) -> Database:
+    return request.app.state.database

@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # 请求超时（秒）
     http_timeout_seconds: float = 60.0
 
+    # ---- 数据持久化（Phase 2：SQLite + SQLAlchemy）----
+    # SQLite 文件路径；":memory:" 可用于无状态测试/演示
+    database_url: str = "sqlite:///./aiops.db"
+    # 故障自愈 Agent 审批策略：流程驱动（工单式），HIGH 风险强制审批
+    autoheal_high_risk_requires_approval: bool = True
+
     # 沙箱：允许的命令白名单前缀（骨架阶段；生产环境请切换为容器沙箱）
     sandbox_allowed_commands: list[str] = [
         "echo", "ls", "cat", "uname", "df", "free", "uptime", "whoami",

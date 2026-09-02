@@ -1,15 +1,43 @@
-"""端到端 API 集成测试（TestClient，无真实模型，全程 Mock 降级）。"""
+"""端到端 API 集成测试（TestClient，无真实模型，全程 Mock 降级）。
+
+注意：必须在 import app.main 之前把数据库指向临时文件，避免测试污染仓库内的
+aiops.db（get_settings 有 lru_cache，首次 build_app 即固化配置）。
+"""
 from __future__ import annotations
 
-import pytest
-from fastapi.testclient import TestClient
+import os
+import tempfile
+from pathlib import Path
 
-from app.main import build_app
+_p2_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_p2_tmp.close()
+os.environ["AIOPS_DATABASE_URL"] = f"sqlite:///{_p2_tmp.name}"
+import atexit  # noqa: E402
+import gc  # noqa: E402
+
+
+@atexit.register
+def _cleanup_p2_db() -> None:
+    gc.collect()
+    try:
+        Path(_p2_tmp.name).unlink(missing_ok=True)
+    except PermissionError:
+        pass  # 主释放见 client fixture teardown
+
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.main import build_app  # noqa: E402
 
 
 @pytest.fixture(scope="module")
 def client() -> TestClient:
-    return TestClient(build_app())
+    app = build_app()
+    with TestClient(app) as c:
+        yield c
+    app.state.database.engine.dispose()
+    gc.collect()
 
 
 def test_healthz(client: TestClient) -> None:
@@ -79,3 +107,72 @@ def test_rag_endpoints(client: TestClient) -> None:
     r = client.post("/api/v1/rag/search", json={"query": "Nginx 502", "top_k": 1})
     assert r.status_code == 200
     assert len(r.json()["hits"]) >= 1
+
+
+# ---------------- Phase 2：ITSM 工单引擎 + 故障自愈 ----------------
+
+def test_itsm_ticket_crud_and_transition(client: TestClient) -> None:
+    r = client.post("/api/v1/itsm", json={
+        "ticket_type": "incident", "title": "接口 502", "description": "后端不可用",
+    })
+    assert r.status_code == 200
+    tid = r.json()["id"]
+    assert r.json()["status"] == "open"
+
+    r = client.get(f"/api/v1/itsm/{tid}")
+    assert r.status_code == 200 and r.json()["title"] == "接口 502"
+
+    r = client.post(f"/api/v1/itsm/{tid}/transition", json={"to_status": "resolved", "actor": "sre"})
+    assert r.status_code == 200 and r.json()["status"] == "resolved"
+
+    # 非法状态 -> 400
+    r = client.post(f"/api/v1/itsm/{tid}/transition", json={"to_status": "nonsense"})
+    assert r.status_code == 400
+
+
+def test_itsm_approval_flow(client: TestClient) -> None:
+    # 通过故障自愈生成待审批任务
+    r = client.post("/api/v1/autoheal/run", json={"incident": "服务发生 502 错误"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "needs_human"
+    assert data["ticket_id"] is not None
+
+    # 待审批
+    r = client.get("/api/v1/itsm/approvals/pending")
+    assert r.status_code == 200
+    approvals = r.json()["approvals"]
+    assert len(approvals) >= 1
+    ap_id = approvals[0]["id"]
+
+    # 批准
+    r = client.post(f"/api/v1/itsm/approvals/{ap_id}/decide",
+                    json={"approve": True, "actor": "ops", "comment": "确认"})
+    assert r.status_code == 200 and r.json()["status"] == "approved"
+
+    # 重复决策 -> 409
+    r = client.post(f"/api/v1/itsm/approvals/{ap_id}/decide",
+                    json={"approve": False, "actor": "ops"})
+    assert r.status_code == 409
+
+
+def test_autoheal_run_lifecycle(client: TestClient) -> None:
+    r = client.post("/api/v1/autoheal/run", json={"incident": "磁盘 disk_full 空间不足"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["run_id"] is not None
+    assert data["status"] == "needs_human"
+    assert data["diagnosis"] != ""
+
+    r = client.get(f"/api/v1/autoheal/runs/{data['run_id']}")
+    assert r.status_code == 200 and r.json()["incident"].startswith("磁盘")
+
+
+def test_itsm_knowledge_feedback(client: TestClient) -> None:
+    r = client.post("/api/v1/itsm", json={"title": "沉淀知识", "source": "manual"})
+    tid = r.json()["id"]
+    r = client.post(f"/api/v1/itsm/{tid}/knowledge", json={"text": "处置过程与结论"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    # 验证已入库
+    r = client.post("/api/v1/rag/search", json={"query": "处置过程", "top_k": 3})
+    assert any(h["doc_id"] == f"ticket-{tid}" for h in r.json()["hits"])
